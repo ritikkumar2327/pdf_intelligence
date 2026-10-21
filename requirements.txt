@@ -1,7 +1,6 @@
 
 streamlit
 pypdf
-sentence-transformers
-transformers
+scikit-learn
+transformers==4.57.6
 torch
-numpy

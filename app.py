@@ -1,154 +1,89 @@
-
-import re
 import streamlit as st
+import chromadb
+import anthropic
 from pypdf import PdfReader
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from transformers import pipeline
+from sentence_transformers import SentenceTransformer
 
-st.set_page_config(page_title="PDF Intelligence", page_icon="📚")
-st.title("📚 PDF Intelligence")
-st.subheader("AI Document Question-Answering Assistant")
-st.write("Upload a PDF and ask questions about its content.")
+# ---------- Setup (cached so they load only once) ----------
+@st.cache_resource
+def load_embedder():
+    return SentenceTransformer("all-MiniLM-L6-v2")
 
 @st.cache_resource
-def load_qa_model():
-    return pipeline(
-        "question-answering",
-        model="deepset/roberta-base-squad2"
-    )
+def load_db():
+    return chromadb.Client()
 
-def extract_chunks(pdf):
-    reader = PdfReader(pdf)
-    chunks = []
+embedder = load_embedder()
+db = load_db()
+ai = anthropic.Anthropic()   # reads ANTHROPIC_API_KEY from your environment
 
-    for page_no, page in enumerate(reader.pages, start=1):
-        text = re.sub(r"\s+", " ", page.extract_text() or "").strip()
+# ---------- Functions ----------
+def read_pdf(file):
+    reader = PdfReader(file)
+    return "\n".join(page.extract_text() or "" for page in reader.pages)
 
-        if not text:
-            continue
+def split_text(text, size=800, overlap=150):
+    chunks, start = [], 0
+    while start < len(text):
+        chunks.append(text[start:start + size])
+        start += size - overlap
+    return chunks
 
-        size, overlap = 1000, 150
-        for start in range(0, len(text), size - overlap):
-            part = text[start:start + size].strip()
-            if part:
-                chunks.append({"page": page_no, "text": part})
-
-    return len(reader.pages), chunks
-
-def find_passages(question, chunks):
-    texts = [c["text"] for c in chunks]
-
-    # Do not remove common words: short questions may depend on them.
-    vectorizer = TfidfVectorizer(
-        ngram_range=(1, 2),
-        sublinear_tf=True,
-        strip_accents="unicode"
-    )
-
-    matrix = vectorizer.fit_transform(texts)
-    q_vector = vectorizer.transform([question])
-    scores = cosine_similarity(q_vector, matrix).flatten()
-
-    ranked = scores.argsort()[::-1]
-    matches = [
-        (chunks[int(i)], float(scores[i]))
-        for i in ranked[:5]
-        if scores[i] > 0
-    ]
-
-    # Handle questions explicitly asking for the first problem/question.
-    q = question.lower()
-    if any(phrase in q for phrase in [
-        "first question", "first problem",
-        "first task", "beginning of the document"
-    ]):
-        first_page = [c for c in chunks if c["page"] == 1]
-        if first_page:
-            first_chunk = first_page[0]
-            if all(c["text"] != first_chunk["text"] for c, _ in matches):
-                matches.insert(0, (first_chunk, 0.0))
-
-    return matches[:5]
-
-uploaded = st.file_uploader("Upload your PDF document", type=["pdf"])
-
-if uploaded:
+def index_chunks(chunks):
+    # start fresh for each new document
     try:
-        page_count, chunks = extract_chunks(uploaded)
-        st.success(f"PDF loaded: {page_count} pages")
-        st.write(f"Text sections available: {len(chunks)}")
+        db.delete_collection("docs")
+    except Exception:
+        pass
+    collection = db.create_collection("docs")
+    embeddings = embedder.encode(chunks).tolist()
+    ids = [f"chunk_{i}" for i in range(len(chunks))]
+    collection.add(documents=chunks, embeddings=embeddings, ids=ids)
 
-        if not chunks:
-            st.error("No readable text found. This PDF may need OCR.")
-        else:
-            question = st.text_input(
-                "Ask a question about your PDF",
-                placeholder="Example: What is the first problem?"
-            )
+def retrieve(question, k=4):
+    collection = db.get_collection("docs")
+    q_emb = embedder.encode([question]).tolist()
+    result = collection.query(query_embeddings=q_emb, n_results=k)
+    return result["documents"][0]
 
-            if st.button("Find Answer", type="primary"):
-                if not question.strip():
-                    st.warning("Please enter a question.")
-                else:
-                    try:
-                        with st.spinner("Searching the PDF and generating an answer..."):
-                            matches = find_passages(question.strip(), chunks)
+def answer(question):
+    chunks = retrieve(question)
+    context = "\n\n".join(chunks)
+    prompt = f"""Answer the question using ONLY the context below.
+If the answer is not in the context, say "I could not find this in the documents."
 
-                            if not matches:
-                                st.warning(
-                                    "No matching passage was found. "
-                                    "Try using words from the PDF."
-                                )
-                            else:
-                                qa = load_qa_model()
-                                candidates = []
+Context:
+{context}
 
-                                # Ask the model about each retrieved passage.
-                                for chunk, similarity in matches:
-                                    result = qa(
-                                        question=question.strip(),
-                                        context=chunk["text"]
-                                    )
-                                    candidates.append({
-                                        "answer": result["answer"].strip(),
-                                        "score": float(result["score"]),
-                                        "page": chunk["page"],
-                                        "text": chunk["text"],
-                                        "similarity": similarity
-                                    })
+Question: {question}"""
+    reply = ai.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=800,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return reply.content[0].text, chunks
 
-                                best = max(candidates, key=lambda x: x["score"])
+# ---------- User interface ----------
+st.title("Chat with your documents")
 
-                        st.markdown("### Answer")
-                        if best["answer"] and best["score"] >= 0.03:
-                            st.write(best["answer"])
-                            st.caption(f"Source: PDF page {best['page']}")
-                        else:
-                            st.warning(
-                                "I couldn't identify a reliable answer. "
-                                "Check the passages below or rephrase the question."
-                            )
+file = st.file_uploader("Upload a PDF", type="pdf")
 
-                        st.caption(
-                            f"Model score: {best['score']:.3f}. "
-                            "This score does not guarantee factual correctness."
-                        )
+if file and st.session_state.get("indexed_file") != file.name:
+    text = read_pdf(file)
+    if not text.strip():
+        st.error("No text found. This may be a scanned PDF.")
+    else:
+        index_chunks(split_text(text))
+        st.session_state["indexed_file"] = file.name
+        st.success("Document processed!")
 
-                        with st.expander("View relevant passages"):
-                            for i, (chunk, similarity) in enumerate(matches, 1):
-                                st.markdown(
-                                    f"**Passage {i} — Page {chunk['page']}**"
-                                )
-                                st.write(chunk["text"])
-                                st.caption(
-                                    f"Retrieval similarity: {similarity:.3f}"
-                                )
+question = st.text_input("Ask a question about the document")
 
-                    except Exception as e:
-                        st.error("Could not generate the answer.")
-                        st.caption(f"Error type: {type(e).__name__}")
-
-    except Exception as e:
-        st.error("Could not read this PDF.")
-        st.caption(f"Error type: {type(e).__name__}")
+if question and "indexed_file" in st.session_state:
+    with st.spinner("Thinking..."):
+        reply, sources = answer(question)
+    st.write(reply)
+    with st.expander("Sources used"):
+        for s in sources:
+            st.write(s)
+            st.divider()

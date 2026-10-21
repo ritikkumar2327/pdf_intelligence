@@ -1,225 +1,154 @@
 
 import re
-
 import streamlit as st
 from pypdf import PdfReader
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from transformers import pipeline
 
-
-st.set_page_config(
-    page_title="PDF Intelligence",
-    page_icon="📚",
-    layout="wide",
-)
-
+st.set_page_config(page_title="PDF Intelligence", page_icon="📚")
 st.title("📚 PDF Intelligence")
 st.subheader("AI Document Question-Answering Assistant")
-st.write(
-    "Upload a PDF and ask questions about its content. "
-    "Answers are extracted from relevant document passages."
-)
+st.write("Upload a PDF and ask questions about its content.")
 
-
-@st.cache_resource(show_spinner=False)
+@st.cache_resource
 def load_qa_model():
     return pipeline(
         "question-answering",
-        model="deepset/roberta-base-squad2",
+        model="deepset/roberta-base-squad2"
     )
 
-
-def extract_chunks(pdf_file, chunk_size=1200, overlap=200):
-    reader = PdfReader(pdf_file)
+def extract_chunks(pdf):
+    reader = PdfReader(pdf)
     chunks = []
 
-    for page_number, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
-        text = re.sub(r"\s+", " ", text).strip()
+    for page_no, page in enumerate(reader.pages, start=1):
+        text = re.sub(r"\s+", " ", page.extract_text() or "").strip()
 
         if not text:
             continue
 
-        step = chunk_size - overlap
-
-        for start in range(0, len(text), step):
-            chunk_text = text[start:start + chunk_size].strip()
-
-            if chunk_text:
-                chunks.append({
-                    "page": page_number,
-                    "text": chunk_text,
-                })
+        size, overlap = 1000, 150
+        for start in range(0, len(text), size - overlap):
+            part = text[start:start + size].strip()
+            if part:
+                chunks.append({"page": page_no, "text": part})
 
     return len(reader.pages), chunks
 
+def find_passages(question, chunks):
+    texts = [c["text"] for c in chunks]
 
-def retrieve_passages(question, chunks, top_k=3):
+    # Do not remove common words: short questions may depend on them.
     vectorizer = TfidfVectorizer(
-        stop_words="english",
         ngram_range=(1, 2),
         sublinear_tf=True,
-        strip_accents="unicode",
+        strip_accents="unicode"
     )
 
-    texts = [chunk["text"] for chunk in chunks]
     matrix = vectorizer.fit_transform(texts)
-    question_vector = vectorizer.transform([question])
+    q_vector = vectorizer.transform([question])
+    scores = cosine_similarity(q_vector, matrix).flatten()
 
-    scores = cosine_similarity(
-        question_vector, matrix
-    ).flatten()
-
-    ranked_indices = scores.argsort()[::-1]
-    ranked_indices = [
-        int(i) for i in ranked_indices if scores[i] > 0
-    ][:top_k]
-
-    return [
-        (chunks[i], float(scores[i]))
-        for i in ranked_indices
+    ranked = scores.argsort()[::-1]
+    matches = [
+        (chunks[int(i)], float(scores[i]))
+        for i in ranked[:5]
+        if scores[i] > 0
     ]
 
+    # Handle questions explicitly asking for the first problem/question.
+    q = question.lower()
+    if any(phrase in q for phrase in [
+        "first question", "first problem",
+        "first task", "beginning of the document"
+    ]):
+        first_page = [c for c in chunks if c["page"] == 1]
+        if first_page:
+            first_chunk = first_page[0]
+            if all(c["text"] != first_chunk["text"] for c, _ in matches):
+                matches.insert(0, (first_chunk, 0.0))
 
-uploaded_file = st.file_uploader(
-    "Upload your PDF document",
-    type=["pdf"],
-)
+    return matches[:5]
 
-if uploaded_file is not None:
+uploaded = st.file_uploader("Upload your PDF document", type=["pdf"])
+
+if uploaded:
     try:
-        with st.spinner("Reading your PDF..."):
-            page_count, chunks = extract_chunks(uploaded_file)
-
+        page_count, chunks = extract_chunks(uploaded)
         st.success(f"PDF loaded: {page_count} pages")
+        st.write(f"Text sections available: {len(chunks)}")
 
         if not chunks:
-            st.warning(
-                "No readable text was found. "
-                "The PDF may be scanned and require OCR."
-            )
-
+            st.error("No readable text found. This PDF may need OCR.")
         else:
-            st.write(f"Text sections available: {len(chunks)}")
-
             question = st.text_input(
                 "Ask a question about your PDF",
-                placeholder=(
-                    "Example: What is the total percentage "
-                    "mentioned in the document?"
-                ),
-                key="pdf_question",
+                placeholder="Example: What is the first problem?"
             )
 
             if st.button("Find Answer", type="primary"):
                 if not question.strip():
                     st.warning("Please enter a question.")
-
                 else:
                     try:
-                        with st.spinner(
-                            "Searching passages and finding an answer..."
-                        ):
-                            matches = retrieve_passages(
-                                question.strip(), chunks, top_k=3
-                            )
+                        with st.spinner("Searching the PDF and generating an answer..."):
+                            matches = find_passages(question.strip(), chunks)
 
                             if not matches:
                                 st.warning(
-                                    "No matching text was found. "
-                                    "Try using important words from "
-                                    "the document or rephrasing "
-                                    "your question."
+                                    "No matching passage was found. "
+                                    "Try using words from the PDF."
                                 )
-
                             else:
-                                # Give the model multiple passages,
-                                # not just the highest-ranked passage.
-                                context_parts = []
+                                qa = load_qa_model()
+                                candidates = []
 
-                                for chunk, _score in matches:
-                                    context_parts.append(
-                                        f"[PDF page {chunk['page']}]\n"
-                                        f"{chunk['text']}"
+                                # Ask the model about each retrieved passage.
+                                for chunk, similarity in matches:
+                                    result = qa(
+                                        question=question.strip(),
+                                        context=chunk["text"]
                                     )
+                                    candidates.append({
+                                        "answer": result["answer"].strip(),
+                                        "score": float(result["score"]),
+                                        "page": chunk["page"],
+                                        "text": chunk["text"],
+                                        "similarity": similarity
+                                    })
 
-                                context = "\n\n".join(context_parts)
+                                best = max(candidates, key=lambda x: x["score"])
 
-                                qa_model = load_qa_model()
-
-                                result = qa_model(
-                                    question=question.strip(),
-                                    context=context,
-                                )
-
-                        if matches:
-                            answer = result.get("answer", "").strip()
-                            confidence = float(
-                                result.get("score", 0.0)
+                        st.markdown("### Answer")
+                        if best["answer"] and best["score"] >= 0.03:
+                            st.write(best["answer"])
+                            st.caption(f"Source: PDF page {best['page']}")
+                        else:
+                            st.warning(
+                                "I couldn't identify a reliable answer. "
+                                "Check the passages below or rephrase the question."
                             )
 
-                            st.markdown("### Answer")
-
-                            if answer and confidence >= 0.03:
-                                st.write(answer)
-                            else:
-                                st.warning(
-                                    "The model could not identify "
-                                    "a reliable answer. Try a more "
-                                    "specific question or inspect "
-                                    "the passages below."
-                                )
-                                if answer:
-                                    st.write("Possible answer: " + answer)
-
-                            source_pages = sorted({
-                                chunk["page"]
-                                for chunk, _score in matches
-                            })
-
-                            st.caption(
-                                "Relevant source pages: "
-                                + ", ".join(map(str, source_pages))
-                            )
-
-                            st.caption(
-                                f"Model confidence score: {confidence:.3f}. "
-                                "This is not a guaranteed measure "
-                                "of factual correctness."
-                            )
-
-                            with st.expander(
-                                "View relevant passages"
-                            ):
-                                for rank, (chunk, score) in enumerate(
-                                    matches, start=1
-                                ):
-                                    st.markdown(
-                                        f"**Passage {rank} — "
-                                        f"PDF page {chunk['page']}**"
-                                    )
-                                    st.write(chunk["text"])
-                                    st.caption(
-                                        f"Retrieval similarity: {score:.3f}"
-                                    )
-
-                    except ValueError:
-                        st.error(
-                            "The document text could not be processed. "
-                            "Try a PDF with readable text and a "
-                            "more specific question."
-                        )
-
-                    except Exception as error:
-                        st.error(
-                            "Could not generate an answer. "
-                            "Check the deployment logs for details."
-                        )
                         st.caption(
-                            f"Error type: {type(error).__name__}"
+                            f"Model score: {best['score']:.3f}. "
+                            "This score does not guarantee factual correctness."
                         )
 
-    except Exception as error:
-        st.error("Could not read this PDF file.")
-        st.caption(f"Error type: {type(error).__name__}")
+                        with st.expander("View relevant passages"):
+                            for i, (chunk, similarity) in enumerate(matches, 1):
+                                st.markdown(
+                                    f"**Passage {i} — Page {chunk['page']}**"
+                                )
+                                st.write(chunk["text"])
+                                st.caption(
+                                    f"Retrieval similarity: {similarity:.3f}"
+                                )
+
+                    except Exception as e:
+                        st.error("Could not generate the answer.")
+                        st.caption(f"Error type: {type(e).__name__}")
+
+    except Exception as e:
+        st.error("Could not read this PDF.")
+        st.caption(f"Error type: {type(e).__name__}")
